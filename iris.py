@@ -5,20 +5,39 @@ import re
 import json
 import os
 import random
+import logging
 from collections import defaultdict
 
 # ── Config ────────────────────────────────────────────────────────────────────
-DISCORD_TOKEN   = "MTUxODI3NzA2OTI1ODA5Njk2NA.G1Ul00.0Tt1lWwXOF-iiHZo_Z31eOpYjjrkWpijuR-koM"
+# SECURITY: never hardcode the bot token in source. Set it as an environment
+# variable instead, e.g.:
+#   export DISCORD_TOKEN="your-token-here"      (Linux/Mac)
+#   set DISCORD_TOKEN=your-token-here           (Windows)
+# The token that was previously hardcoded in this file has been exposed and
+# should be regenerated in the Discord Developer Portal immediately.
+DISCORD_TOKEN   = os.environ.get("DISCORD_TOKEN")
 OLLAMA_URL      = "http://localhost:11434/api/chat"
 OLLAMA_BASE     = "http://localhost:11434"
 MODEL           = "llama3.2:latest"
 MAX_HISTORY     = 100
 REFLECT_EVERY   = 10
-SPEAK_CHANNEL   = 1518278721080135814
+SPEAK_CHANNEL   = 1518278721080135814  # only used for unprompted/idle chatter, not for gating normal replies
 BASE_DIR        = os.path.dirname(os.path.abspath(__file__))
 HISTORY_FILE    = os.path.join(BASE_DIR, "iris_memory.json")
 LONGTERM_FILE   = os.path.join(BASE_DIR, "iris_longterm.json")
 # ─────────────────────────────────────────────────────────────────────────────
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+log = logging.getLogger("iris")
+
+if not DISCORD_TOKEN:
+    raise RuntimeError(
+        "DISCORD_TOKEN environment variable is not set. "
+        "Set it before running the bot, e.g. `export DISCORD_TOKEN=...`"
+    )
 
 SYSTEM_PROMPT = """
 you are iris. this is not a description of iris. this is not a character sheet. you are iris, right now, talking in a discord server.
@@ -140,13 +159,13 @@ FEW_SHOT_EXAMPLES = [
 
 def load_json(path, default):
     if os.path.exists(path):
-        with open(path, "r") as f:
+        with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
     return default
 
 def save_json(path, data):
-    with open(path, "w") as f:
-        json.dump(data, f, indent=2)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
 
 def load_history():
     data = load_json(HISTORY_FILE, {})
@@ -187,8 +206,8 @@ async def ollama(messages: list, max_wait: int = 120) -> str:
 
 # ── Long-term memory ──────────────────────────────────────────────────────────
 
-async def reflect(channel_id: int):
-    recent = history[channel_id][-20:]
+async def reflect(memory_key: int):
+    recent = history[memory_key][-20:]
     convo  = "\n".join(f"{m['role']}: {m['content']}" for m in recent)
     try:
         raw = await ollama([
@@ -204,11 +223,11 @@ async def reflect(channel_id: int):
         longterm["notes"] = longterm["notes"][-50:]
         save_longterm()
     except Exception as e:
-        print(f"[reflect] failed: {e}")
+        log.warning(f"[reflect] failed for memory key {memory_key}: {e}")
 
 
-async def reflect_desires(channel_id: int):
-    recent = history[channel_id][-20:]
+async def reflect_desires(memory_key: int):
+    recent = history[memory_key][-20:]
     convo  = "\n".join(f"{m['role']}: {m['content']}" for m in recent)
     current = json.dumps(longterm.get("desires", []))
     prompt = DESIRES_REFLECT_PROMPT.format(current_desires=current)
@@ -221,9 +240,9 @@ async def reflect_desires(channel_id: int):
         if isinstance(desires, list):
             longterm["desires"] = desires[:8]
             save_longterm()
-            print(f"[desires] updated: {desires}")
+            log.info(f"[desires] updated: {desires}")
     except Exception as e:
-        print(f"[desires] failed: {e}")
+        log.warning(f"[desires] failed for memory key {memory_key}: {e}")
 
 
 def build_longterm_block() -> str:
@@ -240,6 +259,9 @@ def build_longterm_block() -> str:
 
 
 # ── Unprompted thoughts ───────────────────────────────────────────────────────
+# Note: SPEAK_CHANNEL only controls where Iris posts idle/unprompted chatter.
+# It does not gate or restrict her normal replies in on_message — those work
+# in every channel, DM, and mention equally.
 
 async def unprompted_thought():
     desires  = "\n".join(f"- {d}" for d in longterm.get("desires", [])) or "none yet"
@@ -249,7 +271,7 @@ async def unprompted_thought():
         reply = await ollama([{"role": "user", "content": prompt}], max_wait=60)
         return reply.strip()
     except Exception as e:
-        print(f"[unprompted] failed: {e}")
+        log.warning(f"[unprompted] failed: {e}")
         return None
 
 
@@ -257,7 +279,7 @@ async def unprompted_loop():
     await client.wait_until_ready()
     channel = client.get_channel(SPEAK_CHANNEL)
     if not channel:
-        print(f"⚠️ couldn't find channel {SPEAK_CHANNEL}")
+        log.warning(f"couldn't find SPEAK_CHANNEL {SPEAK_CHANNEL}")
         return
     while True:
         # wait between 20 and 90 minutes before maybe saying something
@@ -266,8 +288,13 @@ async def unprompted_loop():
         if random.random() < 0.4:
             thought = await unprompted_thought()
             if thought:
-                await channel.send(thought)
-                print(f"[unprompted] iris said: {thought}")
+                try:
+                    await channel.send(thought)
+                    log.info(f"[unprompted] iris said: {thought}")
+                except discord.Forbidden:
+                    log.error(f"[unprompted] missing permission to send in channel {SPEAK_CHANNEL}")
+                except Exception as e:
+                    log.error(f"[unprompted] failed to send: {e}")
 
 
 # ── Keepalive ─────────────────────────────────────────────────────────────────
@@ -299,11 +326,18 @@ NAME_PATTERN = re.compile(r"\biris\b", re.IGNORECASE)
 
 
 # ── Ollama chat ───────────────────────────────────────────────────────────────
+# history[memory_key] and msg_count[memory_key] are keyed by *guild* id (server
+# id), not channel id. That means every channel in the same server shares one
+# conversation history, one reflection cadence, and one save file entry — Iris
+# stays the same "person" whether she's talking in #general or #bot. DMs have
+# no guild, so each DM falls back to being keyed by its own channel id (i.e.
+# each DM conversation is its own separate memory, which is the sensible
+# default for private conversations).
 
-async def chat_with_ollama(channel_id: int, user_msg: str, username: str) -> str:
-    history[channel_id].append({"role": "user", "content": f"[{username}]: {user_msg}"})
-    if len(history[channel_id]) > MAX_HISTORY:
-        history[channel_id].pop(0)
+async def chat_with_ollama(memory_key: int, user_msg: str, username: str) -> str:
+    history[memory_key].append({"role": "user", "content": f"[{username}]: {user_msg}"})
+    if len(history[memory_key]) > MAX_HISTORY:
+        history[memory_key].pop(0)
 
     lt_block   = build_longterm_block()
     desires    = "\n".join(f"- {d}" for d in longterm.get("desires", []))
@@ -315,22 +349,23 @@ async def chat_with_ollama(channel_id: int, user_msg: str, username: str) -> str
 
     try:
         reply = await ollama(
-            [{"role": "system", "content": system_msg}] + FEW_SHOT_EXAMPLES + history[channel_id],
+            [{"role": "system", "content": system_msg}] + FEW_SHOT_EXAMPLES + history[memory_key],
             max_wait=600
         )
-    except Exception:
+    except Exception as e:
+        log.error(f"[chat_with_ollama] ollama call failed for memory key {memory_key}: {e}")
         reply = "...something's wrong. don't ask."
 
-    history[channel_id].append({"role": "assistant", "content": reply})
-    if len(history[channel_id]) > MAX_HISTORY:
-        history[channel_id].pop(0)
+    history[memory_key].append({"role": "assistant", "content": reply})
+    if len(history[memory_key]) > MAX_HISTORY:
+        history[memory_key].pop(0)
 
     save_history()
 
-    msg_count[channel_id] += 1
-    if msg_count[channel_id] % REFLECT_EVERY == 0:
-        asyncio.create_task(reflect(channel_id))
-        asyncio.create_task(reflect_desires(channel_id))
+    msg_count[memory_key] += 1
+    if msg_count[memory_key] % REFLECT_EVERY == 0:
+        asyncio.create_task(reflect(memory_key))
+        asyncio.create_task(reflect_desires(memory_key))
 
     return reply
 
@@ -339,8 +374,8 @@ async def chat_with_ollama(channel_id: int, user_msg: str, username: str) -> str
 
 @client.event
 async def on_ready():
-    print(f"✅ Iris is online — model: {MODEL}")
-    print("⏳ Preloading model...")
+    log.info(f"✅ Iris is online — model: {MODEL}")
+    log.info("⏳ Preloading model...")
     try:
         async with aiohttp.ClientSession() as s:
             async with s.post(OLLAMA_URL, json={
@@ -350,54 +385,86 @@ async def on_ready():
                 "keep_alive": -1,
             }, timeout=aiohttp.ClientTimeout(total=300)) as resp:
                 await resp.json()
-        print("✅ Model loaded and ready")
+        log.info("✅ Model loaded and ready")
     except Exception as e:
-        print(f"⚠️ Preload failed: {e}")
+        log.error(f"⚠️ Preload failed: {e}")
     asyncio.create_task(keepalive_loop())
     asyncio.create_task(unprompted_loop())
+
+    # Log which guild channels the bot can actually see/speak in, to make
+    # per-channel permission problems (e.g. #general vs other channels)
+    # immediately visible in the console instead of failing silently.
+    for guild in client.guilds:
+        for ch in guild.text_channels:
+            perms = ch.permissions_for(guild.me)
+            if not (perms.view_channel and perms.send_messages and perms.read_message_history):
+                log.warning(
+                    f"⚠️ missing permissions in #{ch.name} ({ch.id}): "
+                    f"view={perms.view_channel} send={perms.send_messages} "
+                    f"read_history={perms.read_message_history}"
+                )
 
 
 @client.event
 async def on_message(msg: discord.Message):
-    if msg.author.bot:
-        return
+    try:
+        if msg.author.bot:
+            return
 
-    if msg.content.strip().lower() == "!status":
+        if msg.content.strip().lower() == "!status":
+            try:
+                async with aiohttp.ClientSession() as s:
+                    async with s.get(f"{OLLAMA_BASE}/api/tags", timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                        data = await resp.json()
+                models = [m["name"] for m in data.get("models", [])]
+                loaded = any(MODEL in m for m in models)
+                desires = longterm.get("desires", [])
+                status  = f"✅ `{MODEL}` is loaded and running.\n"
+                status += f"🧠 desires: {len(desires)}\n"
+                for d in desires:
+                    status += f"  - {d}\n"
+                await msg.reply(status if loaded else f"⚠️ Ollama is up but `{MODEL}` isn't loaded yet.")
+            except Exception:
+                await msg.reply("❌ can't reach ollama. is it running?")
+            return
+
+        is_dm      = isinstance(msg.channel, discord.DMChannel)
+        is_mention = client.user.mentioned_in(msg)
+        is_named   = NAME_PATTERN.search(msg.content) is not None
+
+        if not (is_dm or is_mention or is_named):
+            return
+
+        content = re.sub(rf"<@{client.user.id}>", "", msg.content).strip()
+        if not content:
+            content = "(they said my name but nothing else)"
+
+        # Key memory by guild (server), not channel, so all channels in the
+        # same server share one conversation. DMs have no guild, so each DM
+        # is keyed by its own channel id and stays its own separate memory.
+        memory_key = msg.guild.id if msg.guild else msg.channel.id
+
+        async with msg.channel.typing():
+            reply = await chat_with_ollama(memory_key, content, msg.author.display_name)
+
         try:
-            async with aiohttp.ClientSession() as s:
-                async with s.get(f"{OLLAMA_BASE}/api/tags", timeout=aiohttp.ClientTimeout(total=5)) as resp:
-                    data = await resp.json()
-            models = [m["name"] for m in data.get("models", [])]
-            loaded = any(MODEL in m for m in models)
-            desires = longterm.get("desires", [])
-            status  = f"✅ `{MODEL}` is loaded and running.\n"
-            status += f"🧠 desires: {len(desires)}\n"
-            for d in desires:
-                status += f"  - {d}\n"
-            await msg.reply(status if loaded else f"⚠️ Ollama is up but `{MODEL}` isn't loaded yet.")
-        except Exception:
-            await msg.reply("❌ can't reach ollama. is it running?")
-        return
+            if len(reply) <= 2000:
+                await msg.reply(reply)
+            else:
+                for i in range(0, len(reply), 2000):
+                    await msg.channel.send(reply[i:i + 2000])
+        except discord.Forbidden:
+            log.error(
+                f"[on_message] missing permission to reply/send in channel "
+                f"{msg.channel.id} ({getattr(msg.channel, 'name', 'DM')})"
+            )
+        except discord.HTTPException as e:
+            log.error(f"[on_message] failed to send reply in channel {msg.channel.id}: {e}")
 
-    is_dm      = isinstance(msg.channel, discord.DMChannel)
-    is_mention = client.user.mentioned_in(msg)
-    is_named   = NAME_PATTERN.search(msg.content) is not None
-
-    if not (is_dm or is_mention or is_named):
-        return
-
-    content = re.sub(rf"<@{client.user.id}>", "", msg.content).strip()
-    if not content:
-        content = "(they said my name but nothing else)"
-
-    async with msg.channel.typing():
-        reply = await chat_with_ollama(msg.channel.id, content, msg.author.display_name)
-
-    if len(reply) <= 2000:
-        await msg.reply(reply)
-    else:
-        for i in range(0, len(reply), 2000):
-            await msg.channel.send(reply[i:i + 2000])
+    except Exception as e:
+        # Catch-all so one bad message in one channel never silently kills
+        # the handler for that channel going forward.
+        log.error(f"[on_message] unhandled error: {e}", exc_info=True)
 
 
 client.run(DISCORD_TOKEN)

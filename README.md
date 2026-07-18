@@ -41,7 +41,7 @@ pip install discord.py aiohttp
 
 **1. Clone the repo and install dependencies**
 ```
-git clone https://github.com/your-username/iris.git
+git clone https://github.com/en0ps1/Iris-AI.git
 cd iris
 pip install discord.py aiohttp
 ```
